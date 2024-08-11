@@ -1,13 +1,4 @@
-// trait Determinant {
-//     fn determinant(&self) -> f32;
-// }
-
-// struct Mat3([[f32; 3]; 3]);
-// struct Mat4([[f32; 4]; 4]);
-
-// =============================================================================
-
-use tetra_test::*;
+use three_delaunay::*;
 
 fn main() {
     let points = vec![
@@ -16,7 +7,7 @@ fn main() {
         (0.0, 0.2, 0.2).into(),
     ];
 
-    let delaunay = DelaunayTetrahedra::new(
+    let delaunay = compute_tetrahedra(
         vec![
             (-1.0, -1.0, -1.0).into(),
             (1.0, -1.0, -1.0).into(),
@@ -25,7 +16,8 @@ fn main() {
         ],
         vec![TetrahedronIndex::new([0, 1, 2, 3])],
         points.into_iter(),
-    );
+    )
+    .expect("compute tetra");
 
     println!("{:?}", delaunay.points());
     println!("{:?}", delaunay.tetra());

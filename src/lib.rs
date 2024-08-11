@@ -1,3 +1,6 @@
+//! Compute 3D Delaunay tetrahedra of arbitrary points. For usage, see the
+//! documentation for [`compute_tetrahedra`].
+
 use std::ops::{Add, Div, Sub};
 
 use glam::{DMat3, DVec3, Vec3A};
@@ -13,6 +16,7 @@ pub struct Tetrahedron {
 }
 
 impl Tetrahedron {
+    /// Creates a new [`Tetrahedron`] from a set of four points.
     pub fn new(vertices: [DVec3; 4]) -> Tetrahedron {
         Self { vertices }
     }
@@ -72,6 +76,7 @@ impl Tetrahedron {
             && new_p.element_sum() <= 1.0
     }
 
+    /// Returns the bounding box of the circumsphere of this [`Tetrahedron`].
     pub fn bounding_circum_box(&self) -> AABB<DVec3> {
         let (point, radius) = self.compute_circumsphere();
 
@@ -103,6 +108,12 @@ impl TetrahedronIndex {
     }
 }
 
+impl From<[u32; 4]> for TetrahedronIndex {
+    fn from(value: [u32; 4]) -> Self {
+        Self::new(value)
+    }
+}
+
 // =============================================================================
 
 /// A face of a tetrahedron, represented as a three-tuple of indicies into a point array
@@ -126,36 +137,50 @@ impl PartialEq for Face {
 
 // =============================================================================
 
+/// Typedef for a point in our tree
 type TreePoint = [f64; 3];
+
+/// Typedef for a cube in our tree
 type TreeRect = Rectangle<TreePoint>;
+
+/// Typedef for a node in the tree, holding a cube and an index
 type IndexRect = GeomWithData<TreeRect, usize>;
 
 // =============================================================================
 
+/// State and caches for the tetrahedra process
 #[derive(Debug)]
-struct DelaunayTriangulationProcess {
+struct DelaunayProcess {
+    /// Vertex locations
     points: Vec<DVec3>,
+    /// List of active tetrahedra. These are options for 'deletion'
     tetra: Vec<Option<TetrahedronIndex>>,
+    /// Cache for face computation
     faces: Vec<Face>,
+    /// Cache for tetrahedra to remove, by index
     bad_tetrahedra: Vec<usize>,
+    /// Cache for tetrahedra to remove, by tree value
     bad_tree: Vec<IndexRect>,
+    /// Spatial tooling to speed up tetra lookups
     lookup_accel: RTree<IndexRect>,
 }
 
-impl DelaunayTriangulationProcess {
+impl DelaunayProcess {
     fn new(points: Vec<DVec3>, bounding_tetra: Vec<TetrahedronIndex>) -> Self {
+        // Set up cache
         let mut ret = Self {
             points,
-            tetra: bounding_tetra.into_iter().map(|f| Some(f)).collect(),
+            tetra: bounding_tetra.into_iter().map(Some).collect(),
             faces: Default::default(),
             bad_tetrahedra: Default::default(),
             bad_tree: Default::default(),
             lookup_accel: Default::default(),
         };
 
+        // Set up initial accel structure
         for (bounding_i, bounding) in ret.tetra.iter().enumerate() {
             let bb = ret
-                .realize_tetra(&bounding.as_ref().unwrap())
+                .realize_tetra(bounding.as_ref().unwrap())
                 .bounding_circum_box();
 
             ret.lookup_accel.insert(IndexRect::new(
@@ -167,6 +192,7 @@ impl DelaunayTriangulationProcess {
         ret
     }
 
+    /// Turn an index based tetra into an actual tetra with vertex info
     fn realize_tetra(&self, tetra: &TetrahedronIndex) -> Tetrahedron {
         Tetrahedron {
             vertices: [
@@ -178,70 +204,83 @@ impl DelaunayTriangulationProcess {
         }
     }
 
-    pub fn add_points<T: Iterator<Item = DVec3>>(&mut self, from: T) {
+    /// Add points from an iterator
+    pub fn add_points<T: Iterator<Item = DVec3>>(&mut self, from: T) -> Result<(), TetraError> {
         for p in from {
-            self.add_point(p)
+            self.add_point(p)?
         }
+        Ok(())
     }
 
-    fn add_point(&mut self, point: DVec3) {
+    /// Add a single point
+    fn add_point(&mut self, point: DVec3) -> Result<(), TetraError> {
+        // Clear caches
         self.bad_tetrahedra.clear();
         self.bad_tree.clear();
 
+        // Go through all tetra with a circumsphere that contains this point
         for rect in self.lookup_accel.locate_all_at_point(&point.into()) {
             let tetra = self.tetra[rect.data].as_ref().unwrap();
-            let realized = self.realize_tetra(&tetra);
+            let realized = self.realize_tetra(tetra);
 
+            // Point is in this circumsphere, so we need to remove this tetra
             if realized.in_circumsphere(point) {
                 self.bad_tetrahedra.push(rect.data);
                 self.bad_tree.push(*rect);
             }
         }
 
-        self.find_boundary_polygon();
+        // Build face cache, or faces that we will need to build tetra out of
+        self.find_boundary_polygon()?;
 
         // Remove bad tetrahedra
         for bad_tetra_index in &self.bad_tetrahedra {
             self.tetra[*bad_tetra_index] = None;
         }
 
-        // we also need to erase the tetra in our accel tree
+        // We also need to erase the tetra in our accel tree
         for bad_tree_node in &self.bad_tree {
             self.lookup_accel.remove(bad_tree_node);
         }
 
+        // Build the new tetra
         self.create_new_tetrahedra(point);
+
+        Ok(())
     }
 
-    fn find_boundary_polygon(&mut self) {
+    /// Builds faces that will need to be connected to new tetra. This fills the faces cache, and uses the bad_tetrahedra cache
+    ///
+    fn find_boundary_polygon(&mut self) -> Result<(), TetraError> {
         self.faces.clear();
 
         for &bad_tetra_index in &self.bad_tetrahedra {
             let Some(bad_tetra) = &self.tetra[bad_tetra_index] else {
                 // well, this would be bad
-                panic!("Bad tetra!");
+                return Err(TetraError::MissingTetra);
             };
-            for i in 0..4 {
-                for j in (i + 1)..4 {
-                    for k in (j + 1)..4 {
-                        let face = Face::new([
-                            bad_tetra.vertices[i],
-                            bad_tetra.vertices[j],
-                            bad_tetra.vertices[k],
-                        ]);
 
-                        let is_shared = self.faces.iter().any(|f| f == &face);
-                        if is_shared {
-                            self.faces.retain(|f| f != &face);
-                        } else {
-                            self.faces.push(face);
-                        }
-                    }
+            // Go over all vertex and create faces, and see who matches
+            use itertools::Itertools;
+
+            for (&i, &j, &k) in bad_tetra.vertices.iter().tuple_combinations() {
+                let face = Face::new([i, j, k]);
+
+                let is_shared = self.faces.iter().any(|f| f == &face);
+                if is_shared {
+                    // face is shared, remove all those that aren't equal
+                    self.faces.retain(|f| f != &face);
+                } else {
+                    // keep face
+                    self.faces.push(face);
                 }
             }
         }
+
+        Ok(())
     }
 
+    /// Create a new tetrahedra from the face cache.
     fn create_new_tetrahedra(&mut self, point: DVec3) {
         let pid = self.points.len().try_into().unwrap();
         self.points.push(point);
@@ -267,7 +306,45 @@ impl DelaunayTriangulationProcess {
 
 // =============================================================================
 
-/// Compute the Delaunay Tetrahedralization of a list of points.
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum TetraError {
+    #[error("Internal error, missing tetrahedra!")]
+    MissingTetra,
+}
+
+/// Computes tetrahedra of arbitrary points.
+///
+/// This function takes an initial set of tetrahedra (can be only one) which
+/// must bound all subsequent points. This initial tetrahedra is/are then
+/// modified incrementally with points as given from an iterator.
+///
+/// To create an initial set of tetrahedra from a bounding box, consider using
+/// [`create_bounding_tetrahedra`].
+///
+/// # Errors
+///
+/// This function may return errors; some corner cases are not yet handled.
+pub fn compute_tetrahedra<T>(
+    inital_points: Vec<DVec3>,
+    bounding_tetra: Vec<TetrahedronIndex>,
+    other_points: T,
+) -> Result<DelaunayTetrahedra, TetraError>
+where
+    T: Iterator<Item = DVec3>,
+{
+    let mut p = DelaunayProcess::new(inital_points, bounding_tetra);
+
+    p.add_points(other_points)?;
+
+    Ok(DelaunayTetrahedra {
+        points: p.points,
+        tetra: p.tetra.into_iter().flatten().collect(),
+    })
+}
+
+/// Results of computing tetrahedra
 #[derive(Debug)]
 pub struct DelaunayTetrahedra {
     points: Vec<DVec3>,
@@ -275,31 +352,18 @@ pub struct DelaunayTetrahedra {
 }
 
 impl DelaunayTetrahedra {
-    pub fn new<T: Iterator<Item = DVec3>>(
-        inital_points: Vec<DVec3>,
-        bounding_tetra: Vec<TetrahedronIndex>,
-        from: T,
-    ) -> Self {
-        let mut p = DelaunayTriangulationProcess::new(inital_points, bounding_tetra);
-
-        p.add_points(from);
-
-        Self {
-            points: p.points,
-            tetra: p.tetra.into_iter().filter_map(|f| f).collect(),
-        }
-    }
-
+    /// Returns a reference to the vertex locations of this [`DelaunayTetrahedra`] result.
     pub fn points(&self) -> &[DVec3] {
         &self.points
     }
 
+    /// Returns a reference to the list of tetra of this [`DelaunayTetrahedra`] result. These tetra contain indices into the point list.
     pub fn tetra(&self) -> &[TetrahedronIndex] {
         &self.tetra
     }
 
-    #[allow(unused)]
-    fn realize_tetra(&self, tetra: &TetrahedronIndex) -> Tetrahedron {
+    /// Convert an indexed tetra into one with vertex information
+    pub fn realize_tetra(&self, tetra: &TetrahedronIndex) -> Tetrahedron {
         Tetrahedron {
             vertices: [
                 self.points[tetra.vertices[0] as usize],
@@ -313,6 +377,7 @@ impl DelaunayTetrahedra {
 
 // =============================================================================
 
+/// An axis-aligned bounding box
 pub struct AABB<T> {
     min: T,
     max: T,
@@ -331,7 +396,10 @@ where
 }
 
 pub trait StrictBound {
+    /// Check if all components of a vector are less than another
     fn all_less_than(&self, other: &Self) -> bool;
+
+    /// Check if all components of a vector are greater than another
     fn all_less_eq_than(&self, other: &Self) -> bool;
 }
 
@@ -353,6 +421,9 @@ impl StrictBound for DVec3 {
     }
 }
 
+/// Create an initial set of tetrahedra that cover a bounding box.
+///
+/// The result of this function can be directly used with [`compute_tetrahedra`]
 pub fn create_bounding_tetrahedra(
     bounding_box: &AABB<DVec3>,
 ) -> ([DVec3; 8], [TetrahedronIndex; 6]) {
@@ -544,7 +615,7 @@ mod test {
             (0.0, 0.2, 0.2).into(),
         ];
 
-        let delaunay = DelaunayTetrahedra::new(
+        let delaunay = compute_tetrahedra(
             vec![
                 (-1.0, -1.0, -1.0).into(),
                 (1.0, -1.0, -1.0).into(),
@@ -553,7 +624,8 @@ mod test {
             ],
             vec![TetrahedronIndex::new([0, 1, 2, 3])],
             points.iter().cloned(),
-        );
+        )
+        .expect("compute tetra");
 
         // Check no tetrahedra share more than one face
         for i in 0..delaunay.tetra.len() {
