@@ -1,30 +1,30 @@
 use std::ops::{Add, Div, Sub};
 
-use glam::{u64vec3, DVec3, Mat3A, U64Vec3, Vec3A, Vec3Swizzles};
+use glam::{DMat3, DVec3, Vec3A};
 use rstar::{
     primitives::{GeomWithData, Rectangle},
-    RTree, RTreeObject,
+    RTree,
 };
 
 /// A Tetrehedron, represented as 4x 3D points.
 #[derive(Debug)]
 pub struct Tetrahedron {
-    vertices: [Vec3A; 4],
+    vertices: [DVec3; 4],
 }
 
 impl Tetrahedron {
-    pub fn new(vertices: [Vec3A; 4]) -> Tetrahedron {
+    pub fn new(vertices: [DVec3; 4]) -> Tetrahedron {
         Self { vertices }
     }
 
     /// Check if a point is inside the circumsphere of this [`Tetrahedron`].
-    fn in_circumsphere(&self, point: Vec3A) -> bool {
+    fn in_circumsphere(&self, point: DVec3) -> bool {
         let (center, radius) = self.compute_circumsphere();
         (point - center).length() < radius
     }
 
     /// Returns the circumsphere of this [`Tetrahedron`], as a point and radius.
-    pub fn compute_circumsphere(&self) -> (Vec3A, f32) {
+    pub fn compute_circumsphere(&self) -> (DVec3, f64) {
         // https://math.stackexchange.com/questions/2414640/circumsphere-of-a-tetrahedron
         let u1 = self.vertices[1] - self.vertices[0];
         let u2 = self.vertices[2] - self.vertices[0];
@@ -47,7 +47,7 @@ impl Tetrahedron {
     }
 
     /// Returns the volume of this [`Tetrahedron`].
-    pub fn volume(&self) -> f32 {
+    pub fn volume(&self) -> f64 {
         let a = self.vertices[1] - self.vertices[0];
         let b = self.vertices[2] - self.vertices[0];
         let c = self.vertices[3] - self.vertices[0];
@@ -56,26 +56,26 @@ impl Tetrahedron {
     }
 
     /// Compute the tetrahedra-local (barycentric) coordinate matrix for this [`Tetrahedron`].
-    pub fn to_tetra_coords(&self) -> Mat3A {
+    pub fn to_tetra_coords(&self) -> DMat3 {
         let a = self.vertices[1] - self.vertices[0];
         let b = self.vertices[2] - self.vertices[0];
         let c = self.vertices[3] - self.vertices[0];
 
-        glam::mat3a(a, b, c).transpose().inverse()
+        glam::dmat3(a, b, c).transpose().inverse()
     }
 
     /// Test if a point is inside this [`Tetrahedron`]. This can be expensive to call repeatedly.
-    pub fn test_point(&self, point: Vec3A) -> bool {
+    pub fn test_point(&self, point: DVec3) -> bool {
         let new_p = self.to_tetra_coords() * point;
-        new_p.cmple(Vec3A::ONE).all()
-            && new_p.cmpge(Vec3A::ZERO).all()
+        new_p.cmple(DVec3::ONE).all()
+            && new_p.cmpge(DVec3::ZERO).all()
             && new_p.element_sum() <= 1.0
     }
 
-    pub fn bounding_box(&self) -> AABB<Vec3A> {
-        let l = self.vertices[0].min(self.vertices[1].min(self.vertices[2].min(self.vertices[3])));
-        let h = self.vertices[0].max(self.vertices[1].max(self.vertices[2].max(self.vertices[3])));
-        AABB::new(l, h)
+    pub fn bounding_circum_box(&self) -> AABB<DVec3> {
+        let (point, radius) = self.compute_circumsphere();
+
+        AABB::new(point - radius, point + radius)
     }
 }
 
@@ -126,7 +126,7 @@ impl PartialEq for Face {
 
 // =============================================================================
 
-type TreePoint = [f32; 3];
+type TreePoint = [f64; 3];
 type TreeRect = Rectangle<TreePoint>;
 type IndexRect = GeomWithData<TreeRect, usize>;
 
@@ -134,25 +134,29 @@ type IndexRect = GeomWithData<TreeRect, usize>;
 
 #[derive(Debug)]
 struct DelaunayTriangulationProcess {
-    points: Vec<Vec3A>,
-    tetra: Vec<TetrahedronIndex>,
+    points: Vec<DVec3>,
+    tetra: Vec<Option<TetrahedronIndex>>,
     faces: Vec<Face>,
     bad_tetrahedra: Vec<usize>,
+    bad_tree: Vec<IndexRect>,
     lookup_accel: RTree<IndexRect>,
 }
 
 impl DelaunayTriangulationProcess {
-    fn new(points: Vec<Vec3A>, bounding_tetra: Vec<TetrahedronIndex>) -> Self {
+    fn new(points: Vec<DVec3>, bounding_tetra: Vec<TetrahedronIndex>) -> Self {
         let mut ret = Self {
             points,
-            tetra: bounding_tetra,
+            tetra: bounding_tetra.into_iter().map(|f| Some(f)).collect(),
             faces: Default::default(),
             bad_tetrahedra: Default::default(),
+            bad_tree: Default::default(),
             lookup_accel: Default::default(),
         };
 
         for (bounding_i, bounding) in ret.tetra.iter().enumerate() {
-            let bb = ret.realize_tetra(&bounding).bounding_box();
+            let bb = ret
+                .realize_tetra(&bounding.as_ref().unwrap())
+                .bounding_circum_box();
 
             ret.lookup_accel.insert(IndexRect::new(
                 TreeRect::from_corners(bb.min.into(), bb.max.into()),
@@ -174,43 +178,49 @@ impl DelaunayTriangulationProcess {
         }
     }
 
-    pub fn add_points<T: Iterator<Item = Vec3A>>(&mut self, from: T) {
+    pub fn add_points<T: Iterator<Item = DVec3>>(&mut self, from: T) {
         for p in from {
             self.add_point(p)
         }
     }
 
-    fn add_point(&mut self, point: Vec3A) {
-        println!("ADD {point}");
+    fn add_point(&mut self, point: DVec3) {
         self.bad_tetrahedra.clear();
+        self.bad_tree.clear();
 
         for rect in self.lookup_accel.locate_all_at_point(&point.into()) {
-            let tetra = &self.tetra[rect.data];
+            let tetra = self.tetra[rect.data].as_ref().unwrap();
             let realized = self.realize_tetra(&tetra);
 
             if realized.in_circumsphere(point) {
                 self.bad_tetrahedra.push(rect.data);
+                self.bad_tree.push(*rect);
             }
         }
 
         self.find_boundary_polygon();
 
         // Remove bad tetrahedra
-        for &bad_tetra_index in self.bad_tetrahedra.iter().rev() {
-            ERROR HERE. we cant just swap this
-            self.tetra.swap_remove(bad_tetra_index);
+        for bad_tetra_index in &self.bad_tetrahedra {
+            self.tetra[*bad_tetra_index] = None;
+        }
+
+        // we also need to erase the tetra in our accel tree
+        for bad_tree_node in &self.bad_tree {
+            self.lookup_accel.remove(bad_tree_node);
         }
 
         self.create_new_tetrahedra(point);
-
-        println!("DONE {point}");
     }
 
     fn find_boundary_polygon(&mut self) {
         self.faces.clear();
 
         for &bad_tetra_index in &self.bad_tetrahedra {
-            let bad_tetra = &self.tetra[bad_tetra_index];
+            let Some(bad_tetra) = &self.tetra[bad_tetra_index] else {
+                // well, this would be bad
+                panic!("Bad tetra!");
+            };
             for i in 0..4 {
                 for j in (i + 1)..4 {
                     for k in (j + 1)..4 {
@@ -232,7 +242,7 @@ impl DelaunayTriangulationProcess {
         }
     }
 
-    fn create_new_tetrahedra(&mut self, point: Vec3A) {
+    fn create_new_tetrahedra(&mut self, point: DVec3) {
         let pid = self.points.len().try_into().unwrap();
         self.points.push(point);
 
@@ -241,11 +251,11 @@ impl DelaunayTriangulationProcess {
                 vertices: [face.vtx[0], face.vtx[1], face.vtx[2], pid],
             };
 
-            let bounds = self.realize_tetra(&new_tetrahedron).bounding_box();
+            let bounds = self.realize_tetra(&new_tetrahedron).bounding_circum_box();
 
             let spot = self.tetra.len();
 
-            self.tetra.push(new_tetrahedron);
+            self.tetra.push(Some(new_tetrahedron));
 
             self.lookup_accel.insert(IndexRect::new(
                 TreeRect::from_corners(bounds.min.into(), bounds.max.into()),
@@ -260,13 +270,13 @@ impl DelaunayTriangulationProcess {
 /// Compute the Delaunay Tetrahedralization of a list of points.
 #[derive(Debug)]
 pub struct DelaunayTetrahedra {
-    points: Vec<Vec3A>,
+    points: Vec<DVec3>,
     tetra: Vec<TetrahedronIndex>,
 }
 
 impl DelaunayTetrahedra {
-    pub fn new<T: Iterator<Item = Vec3A>>(
-        inital_points: Vec<Vec3A>,
+    pub fn new<T: Iterator<Item = DVec3>>(
+        inital_points: Vec<DVec3>,
         bounding_tetra: Vec<TetrahedronIndex>,
         from: T,
     ) -> Self {
@@ -276,11 +286,11 @@ impl DelaunayTetrahedra {
 
         Self {
             points: p.points,
-            tetra: p.tetra,
+            tetra: p.tetra.into_iter().filter_map(|f| f).collect(),
         }
     }
 
-    pub fn points(&self) -> &[Vec3A] {
+    pub fn points(&self) -> &[DVec3] {
         &self.points
     }
 
@@ -303,46 +313,20 @@ impl DelaunayTetrahedra {
 
 // =============================================================================
 
-/// Take a 3d coordinate, and map to a linear address
-#[inline]
-fn d_index(at: U64Vec3, counts: U64Vec3) -> u32 {
-    (at.x + (at.y * counts.y) + (at.z * counts.yz().element_product())) as u32
-}
-
-/// Map a position to a cell_id
-#[inline]
-fn map_position_to_cell_id(v: Vec3A, bb_min: Vec3A, cell_count: Vec3A) -> U64Vec3 {
-    (v - bb_min / cell_count).floor().as_u64vec3()
-}
-
 pub struct AABB<T> {
     min: T,
     max: T,
-    range: T,
 }
 
 impl<T> AABB<T>
 where
     T: Sub<Output = T> + Copy + Add<Output = T> + Div<Output = T>,
     <T as Add>::Output: Div<T>,
-    T: From<(f32, f32, f32)>,
+    T: From<(f64, f64, f64)>,
     T: StrictBound,
 {
     fn new(min: T, max: T) -> Self {
-        Self {
-            min,
-            max,
-            range: max - min,
-        }
-    }
-
-    fn center(&self) -> <T as Div>::Output {
-        let d: T = (2.0, 2.0, 2.0).into();
-        self.min + self.range / d
-    }
-
-    fn contains(&self, value: T) -> bool {
-        self.min.all_less_eq_than(&value) && !self.max.all_less_than(&value)
+        Self { min, max }
     }
 }
 
@@ -370,8 +354,8 @@ impl StrictBound for DVec3 {
 }
 
 pub fn create_bounding_tetrahedra(
-    bounding_box: &AABB<Vec3A>,
-) -> ([Vec3A; 8], [TetrahedronIndex; 6]) {
+    bounding_box: &AABB<DVec3>,
+) -> ([DVec3; 8], [TetrahedronIndex; 6]) {
     let points = [
         [false, false, false], //0
         [false, false, true],  //1
@@ -384,7 +368,7 @@ pub fn create_bounding_tetrahedra(
     ]
     .map(|f| {
         let mask = f.into();
-        Vec3A::select(mask, bounding_box.max, bounding_box.min)
+        DVec3::select(mask, bounding_box.max, bounding_box.min)
     });
 
     let tetra = [
@@ -398,132 +382,7 @@ pub fn create_bounding_tetrahedra(
 
     (points, tetra)
 }
-/*
-#[deprecated]
-pub fn parallel_delaunay(bounding_box: AABB<Vec3A>, all_points: &[Vec3A]) {
-    let (initial_points, initial_tetra) = create_bounding_tetrahedra(&bounding_box);
 
-    let bounding_range = bounding_box.range.as_dvec3();
-
-    let cell_counts = {
-        const AVERAGE_POINT_IN_CELL: i32 = 8;
-
-        let num_points = all_points.len() as f64;
-
-        let denom = 3.0 * (AVERAGE_POINT_IN_CELL as f64) * bounding_range.element_product();
-
-        let beta = num_points / denom;
-
-        (bounding_range * beta).ceil().as_u64vec3()
-    };
-
-    // Our work granularity is one cell
-
-    // we need to create zones
-
-    let cell_size = cell_counts.as_dvec3() / bounding_range;
-    let cell_count_as_float = cell_counts.as_vec3a();
-
-    // assign points to a cell
-    let point_id_to_cell_id: Vec<_> = all_points
-        .iter()
-        .map(|f| {
-            d_index(
-                map_position_to_cell_id(*f, bounding_box.min, cell_count_as_float),
-                cell_counts,
-            )
-        })
-        .collect();
-
-    let piter = all_points
-        .iter()
-        .enumerate()
-        .map(|(i, f)| ([f.x, f.y, f.z], i as u64));
-
-    let tree = kiddo::KdTree::<f32, 3>::from_iter(piter);
-
-    let context = ParaContext {
-        bounding_box,
-        cell_counts,
-        cell_size,
-        tree,
-        point_id_to_cell_id: &point_id_to_cell_id,
-        points: all_points,
-        initial_tetra: &initial_tetra,
-        bounding_points: &initial_points,
-    };
-
-    for i in 0..cell_counts.x {
-        for j in 0..cell_counts.y {
-            for k in 0..cell_counts.z {
-                let cell_coordinate = u64vec3(i, j, k);
-
-                compute_cell(&context, cell_coordinate)
-            }
-        }
-    }
-}
-
-struct ParaContext<'a> {
-    bounding_box: AABB<Vec3A>,
-    cell_counts: U64Vec3,
-    cell_size: DVec3,
-    tree: kiddo::KdTree<f32, 3>,
-    point_id_to_cell_id: &'a [u32],
-    points: &'a [Vec3A],
-    bounding_points: &'a [Vec3A],
-    initial_tetra: &'a [TetrahedronIndex],
-}
-
-impl<'a> ParaContext<'a> {
-    fn cell_bounds(&self, cell_coordinate: U64Vec3) -> AABB<Vec3A> {
-        let min = self.bounding_box.min.as_dvec3() + cell_coordinate.as_dvec3() * self.cell_size;
-        let max = min + self.cell_size;
-
-        let min = min.as_vec3a();
-        let max = max.as_vec3a();
-
-        AABB::new(min, max)
-    }
-
-    fn for_points_in(&self, bounds: AABB<Vec3A>, mut func: impl FnMut(u64)) {
-        let sphere_center = bounds.center();
-        let r: &[f32; 3] = sphere_center.as_ref();
-        let sphere_range = bounds.range.max_element() / 2.0;
-        for item in self
-            .tree
-            .within_unsorted_iter::<SquaredEuclidean>(r, sphere_range)
-        {
-            if bounds.contains(self.points[item.item as usize]) {
-                func(item.item)
-            }
-        }
-    }
-}
-
-fn compute_cell(context: &ParaContext, cell_coordinate: U64Vec3) {
-    let cell_id = d_index(cell_coordinate, context.cell_counts);
-
-    let bounds = context.cell_bounds(cell_coordinate);
-
-    // get all points we are going to need here
-
-    let mut our_points = Vec::new();
-    let mut our_points_id = Vec::new();
-
-    context.for_points_in(bounds, |point_id| {
-        our_points.push(context.points[point_id as usize]);
-        our_points_id.push(point_id);
-        assert!(cell_id == context.point_id_to_cell_id[point_id as usize]);
-    });
-
-    let _ = DelaunayTetrahedra::new(
-        context.bounding_points.to_owned(),
-        context.initial_tetra.to_owned(),
-        our_points.into_iter(),
-    );
-}
-*/
 // =============================================================================
 
 #[cfg(test)]
@@ -537,27 +396,27 @@ mod test {
         fn almost_equal(&self, other: Self, epsilon: Self) -> bool;
     }
 
-    impl AlmostEqual for f32 {
+    impl AlmostEqual for f64 {
         fn almost_equal(&self, other: Self, epsilon: Self) -> bool {
             (self - other).abs() < epsilon
         }
     }
 
-    fn random_sphere_point() -> Vec3A {
-        let x: f32 = rand::thread_rng().sample(StandardNormal);
-        let y: f32 = rand::thread_rng().sample(StandardNormal);
-        let z: f32 = rand::thread_rng().sample(StandardNormal);
+    fn random_sphere_point() -> DVec3 {
+        let x: f64 = rand::thread_rng().sample(StandardNormal);
+        let y: f64 = rand::thread_rng().sample(StandardNormal);
+        let z: f64 = rand::thread_rng().sample(StandardNormal);
 
-        let mut v: Vec3A = (x, y, z).into();
+        let mut v: DVec3 = (x, y, z).into();
 
         if v.length() == 0.0 {
-            v += Vec3A::new(0.01, 0.01, 0.01);
+            v += DVec3::new(0.01, 0.01, 0.01);
         }
 
         v.normalize()
     }
 
-    fn random_sphere_tet() -> (Tetrahedron, Vec3A, f32) {
+    fn random_sphere_tet() -> (Tetrahedron, DVec3, f64) {
         let center_dist = rand::distributions::Uniform::from(-100.0..100.0);
 
         let center = (
@@ -602,20 +461,45 @@ mod test {
 
     #[test]
     fn test_in_circumsphere() {
-        let t = Tetrahedron {
-            vertices: [
-                (0.0, 0.0, 0.0).into(),
-                (1.0, 0.0, 0.0).into(),
-                (0.0, 1.0, 0.0).into(),
-                (0.0, 0.0, 1.0).into(),
-            ],
-        };
+        let mut test_vec: Vec<(Tetrahedron, DVec3, f64)> = Vec::new();
 
-        let inside = Vec3A::splat(0.1);
-        let outside = Vec3A::splat(2.0);
+        test_vec.push((
+            Tetrahedron {
+                vertices: [
+                    (0.0, 0.0, 0.0).into(),
+                    (1.0, 0.0, 0.0).into(),
+                    (0.0, 1.0, 0.0).into(),
+                    (0.0, 0.0, 1.0).into(),
+                ],
+            },
+            glam::dvec3(0.5, 0.5, 0.5),
+            0.866025,
+        ));
 
-        assert!(t.in_circumsphere(inside));
-        assert!(!t.in_circumsphere(outside));
+        test_vec.push((
+            Tetrahedron {
+                vertices: [
+                    (0.0, 0.1, 0.0).into(),
+                    (-1.0, 0.0, 0.0).into(),
+                    (0.0, 0.9, 0.0).into(),
+                    (0.0, 0.0, 1.0).into(),
+                ],
+            },
+            glam::dvec3(-0.545, 0.5, 0.545),
+            0.868361,
+        ));
+
+        for (t, at, rad) in test_vec {
+            let inside = at + DVec3::Z * (rad * 0.99);
+            let outside = at + DVec3::Z * (rad * 1.01);
+            assert!(t.in_circumsphere(inside));
+            assert!(!t.in_circumsphere(outside));
+
+            let cc = t.compute_circumsphere();
+
+            assert!(cc.0.abs_diff_eq(at, 0.0001));
+            assert!(cc.1.almost_equal(rad, 0.0001));
+        }
     }
 
     #[test]
@@ -629,8 +513,8 @@ mod test {
             ],
         };
 
-        let inside = Vec3A::splat(0.1);
-        let outside = Vec3A::splat(2.0);
+        let inside = DVec3::splat(0.1);
+        let outside = DVec3::splat(2.0);
 
         assert!(t.test_point(inside));
         assert!(!t.test_point(outside));
@@ -654,7 +538,7 @@ mod test {
 
     #[test]
     fn test_delaunay_structure() {
-        let points: Vec<Vec3A> = vec![
+        let points: Vec<DVec3> = vec![
             (0.0, 0.0, 0.0).into(),
             (0.0, 0.0, -0.5).into(),
             (0.0, 0.2, 0.2).into(),
@@ -692,21 +576,21 @@ mod test {
             assert_eq!(unique_vertices.len(), 4);
         }
 
-        // Check that no point is inside the circumsphere of any tetrahedron
-        for tetra in &delaunay.tetra {
+        // Check that no point is well inside the circumsphere of any tetrahedron
+        for (tetra_i, tetra) in delaunay.tetra.iter().enumerate() {
             let realized = delaunay.realize_tetra(tetra);
             for point in &points {
                 let cs = realized.compute_circumsphere();
 
-                if realized.in_circumsphere(*point) {
+                let test = (*point - cs.0).length();
+
+                let depth = test - cs.1 + 0.000001;
+
+                if depth < 0.0 {
                     dbg!(&delaunay);
                     panic!(
-                        "Point in circumsphere: {}, Center: {}, Radius: {}, Test: {}, Tetra: {:?}",
-                        point,
-                        cs.0,
-                        cs.1,
-                        (*point - cs.0).length(),
-                        realized
+                        "Point in circumsphere: {}, Center: {}, Radius: {}, Test: {}, Tetra: {:?}, ID: {tetra_i}, DEPTH {depth}",
+                        point, cs.0, cs.1, test, realized
                     )
                 }
             }

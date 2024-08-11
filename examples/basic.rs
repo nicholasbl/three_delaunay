@@ -27,5 +27,6 @@ fn main() {
         points.into_iter(),
     );
 
-    println!("{delaunay:?}");
+    println!("{:?}", delaunay.points());
+    println!("{:?}", delaunay.tetra());
 }
